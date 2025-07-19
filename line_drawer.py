@@ -240,7 +240,6 @@ class MainWindow(QMainWindow):
             if not item:
                 return
 
-            print(f"Active layer changed to {idx}: {self.canvas.layers[idx].name}")
             self.canvas.layers[idx].visible = True
             # チェックボックスもONにし、アンチェック不可
             widget = self.layer_list.itemWidget(item)
