@@ -1,16 +1,14 @@
 import sys
-import random, math
 import PyQt6.QtCore as qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QMenuBar, QMenu, QLabel, QPushButton, QHBoxLayout, QComboBox,
-    QListWidget, QListWidgetItem, QAbstractItemView, QSpinBox, QCheckBox
+    QMenuBar, QMenu, QLabel, QPushButton, QHBoxLayout, QLineEdit,
+    QListWidget, QListWidgetItem, QSpinBox, QCheckBox
 )
 from canvas_dialog import CanvasDialog
 from layer_properties_dialog import LayerPropertiesDialog
 from save_canvas_dialog import SaveCanvasDialog
-from background_color_dialog import BackgroundColorDialog
-from PyQt6.QtGui import QPainter, QPaintEvent, QAction, QPolygonF, QImage
+from PyQt6.QtGui import QAction, QPolygonF, QImage
 
 from layer_properties_dialog import LayerPropertiesDialog
 
@@ -276,25 +274,51 @@ class MainWindow(QMainWindow):
         for idx, layer in enumerate(self.canvas.layers):
             if not layer.visible:
                 continue
-            # 塗り領域
-            for region, rgba in layer.colored_regions:
-                coords = region.exterior.coords
-                rr, gg, bb, aa = rgba
-                qcolor = QColor(rr, gg, bb, aa)
-                painter.setBrush(qcolor)
-                painter.setPen(qcolor)
-                from PyQt6.QtCore import QPointF
-                poly = QPolygonF([QPointF(x, y) for x, y in coords])
-                painter.drawPolygon(poly)
-            # 線
+            mode = getattr(layer, 'save_mode', 0)
+            # --- 塗り領域 ---
+            if mode == 0 or mode == 1:
+                # 通常 or 接する線のみ（塗りは描画）
+                for region, rgba in layer.colored_regions:
+                    coords = region.exterior.coords
+                    rr, gg, bb, aa = rgba
+                    qcolor = QColor(rr, gg, bb, aa)
+                    painter.setBrush(qcolor)
+                    painter.setPen(qcolor)
+                    from PyQt6.QtCore import QPointF
+                    poly = QPolygonF([QPointF(x, y) for x, y in coords])
+                    painter.drawPolygon(poly)
+            # --- 線 ---
             r, g, b, a = layer.line_rgba
             line_color = QColor(r, g, b, a)
             pen = QPen(line_color)
             pen.setWidth(layer.line_width)
             painter.setPen(pen)
             painter.setBrush(QColor(0,0,0,0))
-            for x1, y1, x2, y2 in layer.lines:
-                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+            if mode == 0:
+                # 通常
+                for x1, y1, x2, y2 in layer.lines:
+                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+            else:
+                # 接する線のみ
+                # 塗られている領域
+                colored_polys = [region for region, _ in layer.colored_regions]
+                shared_edges = self.canvas.get_shared_edges(colored_polys, idx)
+                # shared_edgesはLineStringまたはMultiLineString
+                from shapely.geometry import LineString, MultiLineString
+                for edge in shared_edges:
+                    if isinstance(edge, LineString):
+                        coords = list(edge.coords)
+                        if len(coords) == 2:
+                            x1, y1 = coords[0]
+                            x2, y2 = coords[1]
+                            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+                    elif hasattr(edge, 'geoms'):
+                        for geom in edge.geoms:
+                            coords = list(geom.coords)
+                            if len(coords) == 2:
+                                x1, y1 = coords[0]
+                                x2, y2 = coords[1]
+                                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
         painter.end()
         image.save(path)
 
@@ -340,6 +364,8 @@ class LayerListItemWidget(QWidget):
         self.setLayout(layout)
         self.prop_btn.clicked.connect(self.open_properties_dialog)
         self.checkbox.stateChanged.connect(self.toggle_layer_visible)
+        self.label.mouseDoubleClickEvent = self.start_edit_name
+        self.edit = None
 
     def open_properties_dialog(self):
         idx = self.idx
@@ -347,13 +373,15 @@ class LayerListItemWidget(QWidget):
             return
         layer = self.parent.canvas.layers[idx]
         dlg = LayerPropertiesDialog(self.parent, layer_name=layer.name)
+        # 初期値として現在のsave_modeを反映
+        dlg.save_mode_radios[getattr(layer, 'save_mode', 0)].setChecked(True)
         if dlg.exec():
             new_name = dlg.get_name()
             layer.name = new_name
             self.label.setText(new_name)
-            item = self.parent.layer_list.item(idx)
-            if item:
-                item.setText(new_name)
+            # 保存モードも反映
+            mode_idx, _ = dlg.get_save_mode()
+            layer.save_mode = mode_idx
 
     def toggle_layer_visible(self, state):
         if not self.parent.canvas or self.idx >= len(self.parent.canvas.layers):
@@ -361,6 +389,31 @@ class LayerListItemWidget(QWidget):
         layer = self.parent.canvas.layers[self.idx]
         layer.visible = bool(state)
         self.parent.canvas.update()
+
+    def start_edit_name(self, event):
+        if self.edit:
+            return
+        self.edit = QLineEdit(self.label.text())
+        self.layout().replaceWidget(self.label, self.edit)
+        self.label.hide()
+        self.edit.setFocus()
+        self.edit.returnPressed.connect(self.commit_edit_name)
+        self.edit.focusOutEvent = self.commit_edit_name_on_focus_out
+
+    def commit_edit_name(self):
+        new_name = self.edit.text()
+        self.label.setText(new_name)
+        self.label.show()
+        self.layout().replaceWidget(self.edit, self.label)
+        self.edit.deleteLater()
+        self.edit = None
+        # モデルにも反映
+        if self.parent.canvas and self.idx < len(self.parent.canvas.layers):
+            self.parent.canvas.layers[self.idx].name = new_name
+
+    def commit_edit_name_on_focus_out(self, event):
+        QLineEdit.focusOutEvent(self.edit, event)
+        self.commit_edit_name()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

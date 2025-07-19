@@ -1,19 +1,26 @@
-
 import sys
 import random, math
+from typing import List
 from PyQt6.QtWidgets import QWidget
-from PyQt6.QtGui import QPainter, QPaintEvent, QAction, QPolygonF, QImage
+from PyQt6.QtGui import QPainter, QPaintEvent, QPolygonF
 
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union, polygonize
 
 class Layer:
+    save_mode_enum = [
+        "通常",
+        "塗られている領域に接する線のみを保存",
+        "塗られている領域に接する線のみを保存し、塗りつぶしは描画しない"
+    ]
+
     def __init__(self, name, visible=True):
+        self.save_mode = 0  # デフォルトの保存モード（通常）
         self.name = name
         self.visible = visible
         self.lines = []
         self.colored_regions = []
-        self.regions = []  # 領域もレイヤーごとに保持
+        self.regions: List[Polygon] = []  # 領域もレイヤーごとに保持
         self.line_rgba = (0, 0, 0, 255)  # 線の色もレイヤーごとに保持
         self.line_width = 2  # 線の太さ（デフォルト2）
 
@@ -162,7 +169,7 @@ class Canvas(QWidget):
                 qcolor = QColor(r, g, b, a)
                 painter.setBrush(qcolor)
                 painter.setPen(qcolor)
-                poly = QPolygonF([QtCore.QPointF(x, y) for x, y in coords])
+                poly = QPolygonF([QtCore.QPointF(int(x), int(y)) for x, y in coords])
                 painter.drawPolygon(poly)
             # 線描画（レイヤーごとの色と太さ）
             r, g, b, a = layer.line_rgba
@@ -173,3 +180,21 @@ class Canvas(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             for x1, y1, x2, y2 in layer.lines:
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+    def get_shared_edges(self, target_polygons: List[Polygon], layer_idx: int) -> List[LineString]:
+        shared_edges = []
+
+        for target in target_polygons:
+            for other in self.layers[layer_idx].regions:
+                if target.equals(other):
+                    continue  # 同じポリゴンはスキップ
+
+                # 共通部分を取得
+                inter = target.boundary.intersection(other.boundary)
+
+                # 共通部分が線分なら追加
+                if isinstance(inter, LineString):
+                    if not inter.is_empty:
+                        shared_edges.append(inter)
+
+        return shared_edges
