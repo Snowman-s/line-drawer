@@ -220,12 +220,11 @@ class MainWindow(QMainWindow):
     def delete_layer(self):
         if self.canvas and len(self.canvas.layers) > 1:
             idx = self.layer_list.currentRow()
-            if idx >= 0:
-                self.canvas.layers.pop(idx)
-                self.layer_list.takeItem(idx)
-                self.canvas.active_layer = max(0, idx-1)
-                self.layer_list.setCurrentRow(self.canvas.active_layer)
-                self.canvas.update()
+            self.layer_list.takeItem(idx)
+            self.canvas.layers.pop(idx)
+
+            self.canvas.active_layer = self.layer_list.currentRow()
+            self.canvas.update()
 
     def open_canvas_dialog(self):
         dialog = CanvasDialog(self)
@@ -240,6 +239,8 @@ class MainWindow(QMainWindow):
             item = self.layer_list.item(idx)
             if not item:
                 return
+
+            print(f"Active layer changed to {idx}: {self.canvas.layers[idx].name}")
             self.canvas.layers[idx].visible = True
             # チェックボックスもONにし、アンチェック不可
             widget = self.layer_list.itemWidget(item)
@@ -260,12 +261,6 @@ class MainWindow(QMainWindow):
     def save_canvas_dialog(self):
         if not self.canvas:
             return
-        dlg = SaveCanvasDialog(self)
-        if not dlg.exec():
-            return
-        path = dlg.get_params()
-        if not path:
-            return
         w, h = self.canvas.width(), self.canvas.height()
         image = QImage(w, h, QImage.Format.Format_ARGB32)
         from PyQt6.QtGui import QPainter, QColor, QPen
@@ -285,7 +280,7 @@ class MainWindow(QMainWindow):
                     painter.setBrush(qcolor)
                     painter.setPen(qcolor)
                     from PyQt6.QtCore import QPointF
-                    poly = QPolygonF([QPointF(x, y) for x, y in coords])
+                    poly = QPolygonF([QPointF(int(x), int(y)) for x, y in coords])
                     painter.drawPolygon(poly)
             # --- 線 ---
             r, g, b, a = layer.line_rgba
@@ -320,6 +315,13 @@ class MainWindow(QMainWindow):
                                 x2, y2 = coords[1]
                                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
         painter.end()
+        # プレビュー付きダイアログ
+        dlg = SaveCanvasDialog(self, preview_image=image)
+        if not dlg.exec():
+            return
+        path = dlg.get_params()
+        if not path:
+            return
         image.save(path)
 
     def regenerate_active_layer(self):
