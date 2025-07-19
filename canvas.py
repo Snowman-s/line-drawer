@@ -4,7 +4,7 @@ from typing import List
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtGui import QPainter, QPaintEvent, QPolygonF
 
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import unary_union, polygonize
 
 class Layer:
@@ -18,7 +18,7 @@ class Layer:
         self.save_mode = 0  # デフォルトの保存モード（通常）
         self.name = name
         self.visible = visible
-        self.lines = []
+        self.lines: List[LineString] = None
         self.colored_regions = []
         self.regions: List[Polygon] = []  # 領域もレイヤーごとに保持
         self.line_rgba = (0, 0, 0, 255)  # 線の色もレイヤーごとに保持
@@ -104,7 +104,7 @@ class Canvas(QWidget):
                 self.selected_region = None
                 self.update()
 
-    def generate_lines(self, width, height, count=20):
+    def generate_lines(self, width, height, count=20) -> List[LineString]:
         lines = []
         diag = math.hypot(width, height)
         for _ in range(count):
@@ -118,20 +118,19 @@ class Canvas(QWidget):
             y1 = cy - dy
             x2 = cx + dx
             y2 = cy + dy
-            lines.append((x1, y1, x2, y2))
+            lines.append(LineString([(x1, y1), (x2, y2)]))
+
         return lines
 
     def create_regions(self, lines):
-        line_strings = [LineString([(x1, y1), (x2, y2)]) for x1, y1, x2, y2 in lines]
         # キャンバスの四辺を追加
         w, h = self.width(), self.height()
-        border_lines = [
+        all_lines = lines + [
             LineString([(0, 0), (w, 0)]),
             LineString([(w, 0), (w, h)]),
             LineString([(w, h), (0, h)]),
             LineString([(0, h), (0, 0)])
         ]
-        all_lines = line_strings + border_lines
         merged_lines = unary_union(all_lines)
         polygons = polygonize(merged_lines)
         regions = []
@@ -178,8 +177,9 @@ class Canvas(QWidget):
             pen.setWidth(layer.line_width)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            for x1, y1, x2, y2 in layer.lines:
-                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+            for line in layer.lines:
+                painter.drawLine(int(line.coords[0][0]), int(line.coords[0][1]), 
+                                 int(line.coords[1][0]), int(line.coords[1][1]))
 
     def get_shared_edges(self, target_polygons: List[Polygon], layer_idx: int) -> List[LineString]:
         shared_edges = []
@@ -198,3 +198,149 @@ class Canvas(QWidget):
                         shared_edges.append(inter)
 
         return shared_edges
+
+    def _coords_equal(self, c1, c2, tol=1e-6):
+        import math
+        return math.isclose(c1[0], c2[0], abs_tol=tol) and math.isclose(c1[1], c2[1], abs_tol=tol)
+
+    def _merge_connected_lines(self, lines):
+        """
+        Merge connected LineStrings into polylines (list of points).
+        Returns a list of polylines, each as a list of (x, y) tuples.
+        Uses math.isclose for coordinate equality.
+        """
+        from shapely.geometry import LineString
+        unused = [list(line.coords) for line in lines if isinstance(line, LineString)]
+        polylines = []
+        while unused:
+            poly = unused.pop(0)
+            changed = True
+            while changed:
+                changed = False
+                for i, other in enumerate(unused):
+                    if self._coords_equal(poly[-1], other[0]):
+                        poly += other[1:]
+                        unused.pop(i)
+                        changed = True
+                        break
+                    elif self._coords_equal(poly[0], other[-1]):
+                        poly = other[:-1] + poly
+                        unused.pop(i)
+                        changed = True
+                        break
+                    elif self._coords_equal(poly[0], other[0]):
+                        poly = other[::-1] + poly
+                        unused.pop(i)
+                        changed = True
+                        break
+                    elif self._coords_equal(poly[-1], other[-1]):
+                        poly += other[-2::-1]
+                        unused.pop(i)
+                        changed = True
+                        break
+            polylines.append(poly)
+        return polylines
+
+    def to_svg(self, path):
+        w, h = self.width(), self.height()
+        svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">']
+        for idx, layer in enumerate(self.layers):
+            if not layer.visible:
+                continue
+            mode = getattr(layer, 'save_mode', 0)
+            # 塗り領域
+            if mode == 0 or mode == 1:
+                for region, rgba in layer.colored_regions:
+                    coords = list(region.exterior.coords)
+                    r, g, b, a = rgba
+                    fill = f'rgba({r},{g},{b},{a/255:.2f})' if a < 255 else f'rgb({r},{g},{b})'
+                    points = ' '.join(f'{int(x)},{int(y)}' for x, y in coords)
+                    svg.append(f'<polygon points="{points}" style="fill:{fill};stroke:{fill};stroke-width:1" />')
+            # 線
+            r, g, b, a = layer.line_rgba
+            stroke = f'rgba({r},{g},{b},{a/255:.2f})' if a < 255 else f'rgb({r},{g},{b})'
+            sw = layer.line_width
+            if mode == 0:
+                merged_lines = unary_union(layer.lines)
+                # --- 修正: 連続する線をpolyline化 ---
+                if hasattr(merged_lines, 'geoms'):
+                    polylines = self._merge_connected_lines(merged_lines.geoms)
+                    for poly in polylines:
+                        if len(poly) >= 2:
+                            svg.append(f'<polyline points="{" ".join(f"{int(x)},{int(y)}" for x, y in poly)}" style="stroke:{stroke};stroke-width:{sw};fill:none" />')
+                elif isinstance(merged_lines, LineString):
+                    coords = list(merged_lines.coords)
+                    if len(coords) >= 2:
+                        svg.append(f'<polyline points="{" ".join(f"{int(x)},{int(y)}" for x, y in coords)}" style="stroke:{stroke};stroke-width:{sw};fill:none" />')
+            else:
+                colored_polys = [region for region, _ in layer.colored_regions]
+                shared_edges = self.get_shared_edges(colored_polys, idx)
+                merged_lines = unary_union(shared_edges)
+                if hasattr(merged_lines, 'geoms'):
+                    polylines = self._merge_connected_lines(merged_lines.geoms)
+                    for poly in polylines:
+                        if len(poly) >= 2:
+                            svg.append(f'<polyline points="{" ".join(f"{int(x)},{int(y)}" for x, y in poly)}" style="stroke:{stroke};stroke-width:{sw};fill:none" />')
+                elif isinstance(merged_lines, LineString):
+                    coords = list(merged_lines.coords)
+                    if len(coords) >= 2:
+                        svg.append(f'<polyline points="{" ".join(f"{int(x)},{int(y)}" for x, y in coords)}" style="stroke:{stroke};stroke-width:{sw};fill:none" />')
+        svg.append('</svg>')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(svg))
+
+    def to_qimage(self):
+        from PyQt6.QtGui import QImage, QPainter, QColor, QPen, QPolygonF
+        from PyQt6.QtCore import QPointF
+        w, h = self.width(), self.height()
+        image = QImage(w, h, QImage.Format.Format_ARGB32)
+        painter = QPainter(image)
+        for idx, layer in enumerate(self.layers):
+            if not layer.visible:
+                continue
+            mode = getattr(layer, 'save_mode', 0)
+            # 塗り領域
+            if mode == 0 or mode == 1:
+                for region, rgba in layer.colored_regions:
+                    coords = region.exterior.coords
+                    rr, gg, bb, aa = rgba
+                    qcolor = QColor(rr, gg, bb, aa)
+                    painter.setBrush(qcolor)
+                    painter.setPen(qcolor)
+                    poly = QPolygonF([QPointF(x, y) for x, y in coords])
+                    painter.drawPolygon(poly)
+            # 線
+            r, g, b, a = layer.line_rgba
+            line_color = QColor(r, g, b, a)
+            pen = QPen(line_color)
+            pen.setWidth(layer.line_width)
+            painter.setPen(pen)
+            painter.setBrush(QColor(0,0,0,0))
+            if mode == 0:
+                for lines in layer.lines:
+                    coords = list(lines.coords)
+                    if len(coords) == 2:
+                      x1, y1 = coords[0]
+                      x2, y2 = coords[1]
+                      painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+            else:
+                colored_polys = [region for region, _ in layer.colored_regions]
+                shared_edges = self.get_shared_edges(colored_polys, idx)
+                from shapely.geometry import LineString
+                for edge in shared_edges:
+                    if isinstance(edge, LineString):
+                        coords = list(edge.coords)
+                        if len(coords) == 2:
+                            x1, y1 = coords[0]
+                            x2, y2 = coords[1]
+                            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+                    elif hasattr(edge, 'geoms'):
+                        for geom in edge.geoms:
+                            coords = list(geom.coords)
+                            if len(coords) == 2:
+                                x1, y1 = coords[0]
+                                x2, y2 = coords[1]
+                                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        painter.end()
+        return image
+

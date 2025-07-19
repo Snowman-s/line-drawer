@@ -35,7 +35,7 @@ class SaveCanvasDialog(QDialog):
         if preview_image is not None:
             self.set_preview_image(preview_image)
     def open_file_dialog(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存先", self.file_edit.text(), "PNG Files (*.png);;All Files (*)")
+        path, _ = QFileDialog.getSaveFileName(self, "保存先", self.file_edit.text(), "PNG Files (*.png);;SVG Files (*.svg);;All Files (*)")
         if path:
             self.file_edit.setText(path)
     def get_params(self):

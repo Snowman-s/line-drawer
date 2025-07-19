@@ -261,60 +261,7 @@ class MainWindow(QMainWindow):
     def save_canvas_dialog(self):
         if not self.canvas:
             return
-        w, h = self.canvas.width(), self.canvas.height()
-        image = QImage(w, h, QImage.Format.Format_ARGB32)
-        from PyQt6.QtGui import QPainter, QColor, QPen
-        painter = QPainter(image)
-        # レイヤー描画（αチェッカーは描かない）
-        for idx, layer in enumerate(self.canvas.layers):
-            if not layer.visible:
-                continue
-            mode = getattr(layer, 'save_mode', 0)
-            # --- 塗り領域 ---
-            if mode == 0 or mode == 1:
-                # 通常 or 接する線のみ（塗りは描画）
-                for region, rgba in layer.colored_regions:
-                    coords = region.exterior.coords
-                    rr, gg, bb, aa = rgba
-                    qcolor = QColor(rr, gg, bb, aa)
-                    painter.setBrush(qcolor)
-                    painter.setPen(qcolor)
-                    from PyQt6.QtCore import QPointF
-                    poly = QPolygonF([QPointF(int(x), int(y)) for x, y in coords])
-                    painter.drawPolygon(poly)
-            # --- 線 ---
-            r, g, b, a = layer.line_rgba
-            line_color = QColor(r, g, b, a)
-            pen = QPen(line_color)
-            pen.setWidth(layer.line_width)
-            painter.setPen(pen)
-            painter.setBrush(QColor(0,0,0,0))
-            if mode == 0:
-                # 通常
-                for x1, y1, x2, y2 in layer.lines:
-                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-            else:
-                # 接する線のみ
-                # 塗られている領域
-                colored_polys = [region for region, _ in layer.colored_regions]
-                shared_edges = self.canvas.get_shared_edges(colored_polys, idx)
-                # shared_edgesはLineStringまたはMultiLineString
-                from shapely.geometry import LineString, MultiLineString
-                for edge in shared_edges:
-                    if isinstance(edge, LineString):
-                        coords = list(edge.coords)
-                        if len(coords) == 2:
-                            x1, y1 = coords[0]
-                            x2, y2 = coords[1]
-                            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-                    elif hasattr(edge, 'geoms'):
-                        for geom in edge.geoms:
-                            coords = list(geom.coords)
-                            if len(coords) == 2:
-                                x1, y1 = coords[0]
-                                x2, y2 = coords[1]
-                                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-        painter.end()
+        image = self.canvas.to_qimage()
         # プレビュー付きダイアログ
         dlg = SaveCanvasDialog(self, preview_image=image)
         if not dlg.exec():
@@ -322,7 +269,10 @@ class MainWindow(QMainWindow):
         path = dlg.get_params()
         if not path:
             return
-        image.save(path)
+        if path.lower().endswith('.svg'):
+            self.canvas.to_svg(path)
+        else:
+            image.save(path)
 
     def regenerate_active_layer(self):
         if self.canvas and 0 <= self.canvas.active_layer < len(self.canvas.layers):
