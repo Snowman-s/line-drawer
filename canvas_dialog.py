@@ -1,5 +1,4 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QColorDialog, QFileDialog
-from PyQt6.QtGui import QColor
 
 class CanvasDialog(QDialog):
     def __init__(self, parent=None):

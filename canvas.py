@@ -4,14 +4,17 @@ from typing import List
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtGui import QPainter, QPaintEvent, QPolygonF
 
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union, polygonize
 
 class Layer:
     save_mode_enum = [
         "通常",
         "塗られている領域に接する線のみを保存",
-        "塗られている領域に接する線のみを保存し、塗りつぶしは描画しない"
+        "塗られている領域に接する線のみを保存し、塗りつぶしは描画しない",
+        "塗りつぶしだけ", 
+        "塗られている領域の外側の線のみを保存",
+        "塗られている領域の外側の線のみを保存し、塗りつぶしは描画しない"
     ]
 
     def __init__(self, name, visible=True):
@@ -241,6 +244,48 @@ class Canvas(QWidget):
             polylines.append(poly)
         return polylines
 
+    def get_outside_edges(self, colored_polys):
+        """
+        Return edges that are outside colored regions (not shared between regions).
+        """
+        from shapely.geometry import LineString
+
+        # Collect all polygon edges
+        all_edges = []
+        for region in colored_polys:
+            coords = list(region.exterior.coords)
+            for i in range(len(coords) - 1):  # 最後の点は最初の点と同じ（閉じている）
+                edge = LineString([coords[i], coords[i+1]])
+                all_edges.append(edge)
+
+        # Get shared edges
+        shared_edges = []
+        for i, poly1 in enumerate(colored_polys):
+            for j, poly2 in enumerate(colored_polys):
+                if i >= j:
+                    continue
+                inter = poly1.boundary.intersection(poly2.boundary)
+                if inter.is_empty:
+                    continue
+                if isinstance(inter, LineString):
+                    shared_edges.append(inter)
+                elif inter.geom_type == 'MultiLineString':
+                    shared_edges.extend(inter.geoms)
+
+        # Normalize edge key: unordered pair of rounded coords
+        def edge_key(edge):
+            coords = list(edge.coords)
+            if len(coords) != 2:
+                return None
+            a, b = coords
+            a = tuple(round(c, 6) for c in a)
+            b = tuple(round(c, 6) for c in b)
+            return tuple(sorted([a, b]))
+
+        shared_keys = set(edge_key(e) for e in shared_edges if edge_key(e))
+        outside_edges = [e for e in all_edges if edge_key(e) not in shared_keys]
+        return outside_edges
+
     def to_svg(self, path):
         w, h = self.width(), self.height()
         svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">']
@@ -249,7 +294,7 @@ class Canvas(QWidget):
                 continue
             mode = getattr(layer, 'save_mode', 0)
             # 塗り領域
-            if mode == 0 or mode == 1:
+            if mode in (0, 1, 3, 4):  # 通常, 接する線のみ, 塗りつぶしだけ, 外側の線のみ
                 for region, rgba in layer.colored_regions:
                     coords = list(region.exterior.coords)
                     r, g, b, a = rgba
@@ -262,7 +307,6 @@ class Canvas(QWidget):
             sw = layer.line_width
             if mode == 0:
                 merged_lines = unary_union(layer.lines)
-                # --- 修正: 連続する線をpolyline化 ---
                 if hasattr(merged_lines, 'geoms'):
                     polylines = self._merge_connected_lines(merged_lines.geoms)
                     for poly in polylines:
@@ -272,10 +316,26 @@ class Canvas(QWidget):
                     coords = list(merged_lines.coords)
                     if len(coords) >= 2:
                         svg.append(f'<polyline points="{" ".join(f"{int(x)},{int(y)}" for x, y in coords)}" style="stroke:{stroke};stroke-width:{sw};fill:none" />')
-            else:
+            elif mode in (1, 2):
                 colored_polys = [region for region, _ in layer.colored_regions]
                 shared_edges = self.get_shared_edges(colored_polys, idx)
                 merged_lines = unary_union(shared_edges)
+                if hasattr(merged_lines, 'geoms'):
+                    polylines = self._merge_connected_lines(merged_lines.geoms)
+                    for poly in polylines:
+                        if len(poly) >= 2:
+                            svg.append(f'<polyline points="{" ".join(f"{int(x)},{int(y)}" for x, y in poly)}" style="stroke:{stroke};stroke-width:{sw};fill:none" />')
+                elif isinstance(merged_lines, LineString):
+                    coords = list(merged_lines.coords)
+                    if len(coords) >= 2:
+                        svg.append(f'<polyline points="{" ".join(f"{int(x)},{int(y)}" for x, y in coords)}" style="stroke:{stroke};stroke-width:{sw};fill:none" />')
+            elif mode == 3:
+                # 塗りつぶしだけの場合は線は描画しない
+                continue
+            elif mode == 4 or mode == 5:
+                colored_polys = [region for region, _ in layer.colored_regions]
+                outside_edges = self.get_outside_edges(colored_polys)
+                merged_lines = unary_union(outside_edges)
                 if hasattr(merged_lines, 'geoms'):
                     polylines = self._merge_connected_lines(merged_lines.geoms)
                     for poly in polylines:
@@ -289,18 +349,20 @@ class Canvas(QWidget):
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(svg))
 
-    def to_qimage(self):
+    def to_qimage(self, antialiasing=False):
         from PyQt6.QtGui import QImage, QPainter, QColor, QPen, QPolygonF
         from PyQt6.QtCore import QPointF
         w, h = self.width(), self.height()
         image = QImage(w, h, QImage.Format.Format_ARGB32)
         painter = QPainter(image)
+        if antialiasing:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         for idx, layer in enumerate(self.layers):
             if not layer.visible:
                 continue
             mode = getattr(layer, 'save_mode', 0)
             # 塗り領域
-            if mode == 0 or mode == 1:
+            if mode in (0, 1, 3, 4):  # 通常, 接する線のみ, 塗りつぶしだけ, 外側の線のみ
                 for region, rgba in layer.colored_regions:
                     coords = region.exterior.coords
                     rr, gg, bb, aa = rgba
@@ -320,14 +382,35 @@ class Canvas(QWidget):
                 for lines in layer.lines:
                     coords = list(lines.coords)
                     if len(coords) == 2:
-                      x1, y1 = coords[0]
-                      x2, y2 = coords[1]
-                      painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-            else:
+                        x1, y1 = coords[0]
+                        x2, y2 = coords[1]
+                        painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+            elif mode in (1, 2):
                 colored_polys = [region for region, _ in layer.colored_regions]
                 shared_edges = self.get_shared_edges(colored_polys, idx)
                 from shapely.geometry import LineString
                 for edge in shared_edges:
+                    if isinstance(edge, LineString):
+                        coords = list(edge.coords)
+                        if len(coords) == 2:
+                            x1, y1 = coords[0]
+                            x2, y2 = coords[1]
+                            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+                    elif hasattr(edge, 'geoms'):
+                        for geom in edge.geoms:
+                            coords = list(geom.coords)
+                            if len(coords) == 2:
+                                x1, y1 = coords[0]
+                                x2, y2 = coords[1]
+                                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+            elif mode == 3:
+                # 塗りつぶしだけの場合は線は描画しない
+                continue
+            elif mode == 4 or mode == 5:
+                colored_polys = [region for region, _ in layer.colored_regions]
+                outside_edges = self.get_outside_edges(colored_polys)
+                from shapely.geometry import LineString
+                for edge in outside_edges:
                     if isinstance(edge, LineString):
                         coords = list(edge.coords)
                         if len(coords) == 2:

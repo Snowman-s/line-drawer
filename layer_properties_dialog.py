@@ -6,7 +6,7 @@ class LayerPropertiesDialog(QDialog):
     def __init__(self, parent=None, layer_name=""):
         super().__init__(parent)
         self.setWindowTitle("レイヤー情報編集")
-        self.setFixedSize(500, 220)
+        self.setFixedSize(500, 240)
         layout = QVBoxLayout()
         hlayout_name = QHBoxLayout()
         self.name_edit = QLineEdit(layer_name)
@@ -16,7 +16,8 @@ class LayerPropertiesDialog(QDialog):
         # 保存モード選択（ラジオボタン）
         self.save_mode_group = QButtonGroup(self)
         self.save_mode_radios: List[QRadioButton] = []
-        for i, label in enumerate(Layer.save_mode_enum):
+        mode_labels = Layer.save_mode_enum
+        for i, label in enumerate(mode_labels):
             radio = QRadioButton(label)
             self.save_mode_group.addButton(radio, i)
             self.save_mode_radios.append(radio)
@@ -36,6 +37,5 @@ class LayerPropertiesDialog(QDialog):
     def get_name(self):
         return self.name_edit.text()
     def get_save_mode(self):
-        idx = self.save_mode_group.checkedId()
-        text = Layer.save_mode_enum[idx] if idx >= 0 else ""
-        return idx, text
+        return self.save_mode_group.checkedId()
+

@@ -261,9 +261,8 @@ class MainWindow(QMainWindow):
     def save_canvas_dialog(self):
         if not self.canvas:
             return
-        image = self.canvas.to_qimage()
         # プレビュー付きダイアログ
-        dlg = SaveCanvasDialog(self, preview_image=image)
+        dlg = SaveCanvasDialog(self, create_preview_image=lambda antialiasing: self.canvas.to_qimage(antialiasing))
         if not dlg.exec():
             return
         path = dlg.get_params()
@@ -272,7 +271,7 @@ class MainWindow(QMainWindow):
         if path.lower().endswith('.svg'):
             self.canvas.to_svg(path)
         else:
-            image.save(path)
+            self.canvas.to_qimage(dlg.is_antialiasing_enabled()).save(path)
 
     def regenerate_active_layer(self):
         if self.canvas and 0 <= self.canvas.active_layer < len(self.canvas.layers):
@@ -332,7 +331,7 @@ class LayerListItemWidget(QWidget):
             layer.name = new_name
             self.label.setText(new_name)
             # 保存モードも反映
-            mode_idx, _ = dlg.get_save_mode()
+            mode_idx = dlg.get_save_mode()
             layer.save_mode = mode_idx
 
     def toggle_layer_visible(self, state):
