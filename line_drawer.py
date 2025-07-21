@@ -1,25 +1,45 @@
 import sys
+
 import PyQt6.QtCore as qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QMenuBar, QMenu, QLabel, QPushButton, QHBoxLayout, QLineEdit,
-    QListWidget, QListWidgetItem, QSpinBox, QCheckBox
+    QListWidget, QListWidgetItem, QSpinBox, QCheckBox, QVBoxLayout, QLabel, QPushButton, QFileDialog
 )
-from canvas_dialog import CanvasDialog
-from layer_properties_dialog import LayerPropertiesDialog
-from save_canvas_dialog import SaveCanvasDialog
-from PyQt6.QtGui import QAction, QPolygonF, QImage
+from PyQt6.QtGui import QAction
 
-from layer_properties_dialog import LayerPropertiesDialog
-
+from geom import create_regions, generate_lines
 from canvas import Canvas, Layer
 
+from canvas_dialog import CanvasDialog
+from layer_properties_dialog import LayerPropertiesDialog
+from layer_properties_dialog import LayerPropertiesDialog
+from export_canvas_dialog import ExportCanvasDialog
+from progress_bar_dialog import ProgressBarDialog
+
+class CanvasExportWorker(qt.QObject):
+    finished = qt.pyqtSignal()
+
+    def __init__(self, canvas, path, antialiasing=False, progress_callback=None):
+        super().__init__()
+        self.canvas: Canvas = canvas
+        self.path = path
+        self.antialiasing = antialiasing
+        self.progress_callback = progress_callback
+
+    def run(self):
+        if self.path.lower().endswith('.svg'):
+            self.canvas.to_svg(self.path)
+        else:
+            image = self.canvas.to_qimage(self.antialiasing, self.progress_callback)
+            image.save(self.path)
+        self.finished.emit()
+
 class MainWindow(QMainWindow):
-    canvas = None
+    canvas: Canvas = None
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyQt6 Line Drawer")
         self.setGeometry(100, 100, 1000, 600)
 
         self.menu_bar = QMenuBar(self)
@@ -28,12 +48,26 @@ class MainWindow(QMainWindow):
         file_menu = QMenu("ファイル", self)
         self.menu_bar.addMenu(file_menu)
 
-        create_canvas_action = QAction("キャンバス生成", self)
+        create_canvas_action = QAction("新規...", self)
         create_canvas_action.triggered.connect(self.open_canvas_dialog)
         file_menu.addAction(create_canvas_action)
-        save_canvas_action = QAction("キャンバス保存", self)
-        save_canvas_action.triggered.connect(self.save_canvas_dialog)
-        file_menu.addAction(save_canvas_action)
+
+        open_file_action = QAction("開く...", self)
+        open_file_action.triggered.connect(self.open_file_dialog)
+        file_menu.addAction(open_file_action)
+
+        save_overwrite_action = QAction("上書き保存", self)
+        save_overwrite_action.triggered.connect(self.save_overwrite_file)
+        file_menu.addAction(save_overwrite_action)
+
+        save_file_action = QAction("名前を付けて保存...", self)
+        save_file_action.triggered.connect(self.save_file_dialog)
+        file_menu.addAction(save_file_action)
+
+        export_canvas_action = QAction("エクスポート...", self)
+        export_canvas_action.triggered.connect(self.save_canvas_dialog)
+        file_menu.addAction(export_canvas_action)
+
         self.background_color = (255, 255, 255, 255)  # デフォルト白
 
         # 色選択UI（RGBAダイアログ）
@@ -105,16 +139,17 @@ class MainWindow(QMainWindow):
 
         # 初期キャンバス生成（共通化）
         self.init_canvas(800, 600, self.line_count_spin.value())
+        self.setWindowFilePath("")  # 初期はファイルパスなし
 
     def init_canvas(self, w, h, n):
         # キャンバスのクリア＋リサイズ
         if self.canvas:
             self.canvas.setParent(None)
         self.canvas = Canvas(w, h, self)
-        self.canvas.lines = self.canvas.generate_lines(w, h, count=n)
         self.canvas.layers = [Layer("Layer 1")]
-        self.canvas.layers[0].lines = self.canvas.lines
-        self.canvas.layers[0].regions = self.canvas.create_regions(self.canvas.lines)
+        lines = generate_lines(w, h, count=n)
+        self.canvas.layers[0].lines = lines
+        self.canvas.layers[0].regions = create_regions(w, h, lines)
         self.canvas.layers[0].line_width = self.line_width_spin.value()
         self.left_vlayout.insertWidget(1, self.canvas)
         # レイヤー初期化
@@ -201,8 +236,8 @@ class MainWindow(QMainWindow):
         if self.canvas:
             name = f"Layer {len(self.canvas.layers)+1}"
             layer = Layer(name)
-            layer.lines = self.canvas.generate_lines(self.canvas.width(), self.canvas.height(), count=self.line_count_spin.value())
-            layer.regions = self.canvas.create_regions(layer.lines)
+            layer.lines = generate_lines(self.canvas.width(), self.canvas.height(), count=self.line_count_spin.value())
+            layer.regions = create_regions(self.canvas.width(), self.canvas.height(), layer.lines)
             layer.colored_regions = []
             # 新規レイヤーの線色は現在のUIの色
             layer.line_rgba = self.line_rgba
@@ -231,6 +266,7 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             w, h, n = dialog.get_canvas_params()
             self.init_canvas(w, h, n)
+            self.setWindowFilePath("")  # ファイルパスをクリア
 
     def change_active_layer(self, idx):
         if self.canvas:
@@ -257,28 +293,86 @@ class MainWindow(QMainWindow):
                     if other_widget and hasattr(other_widget, 'checkbox'):
                         other_widget.checkbox.setEnabled(True)
 
+    def open_file_dialog(self):
+        import json
+        path, _ = QFileDialog.getOpenFileName(self, "ファイルを開く", "", "JSON Files (*.json);;All Files (*)")
+        if not path: return 
+
+        self.setWindowFilePath(path)
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            json_data = json.loads(f.read())
+
+        self.canvas.reset_from_json(json_data)
+        # レイヤーの初期化
+        self.layer_list.clear()
+        for i, layer in enumerate(self.canvas.layers):
+            item = QListWidgetItem()
+            widget = LayerListItemWidget(layer.name, i, self, checked=layer.visible)
+            self.layer_list.addItem(item)
+            self.layer_list.setItemWidget(item, widget)
+            # 初期レイヤー（選択中）はチェックボックス無効化
+            if i == 0:
+                widget.checkbox.setEnabled(False)
+        self.layer_list.setCurrentRow(self.canvas.active_layer)
+        self.layer_list.currentRowChanged.connect(self.change_active_layer)
+        self.canvas.update()
+        self.update_line_btn()
+
+    def save_file_dialog(self):
+        import json
+        path = QFileDialog.getSaveFileName(self, "名前を付けて保存", "canvas.json", "JSON Files (*.json);;All Files (*)")[0]
+        if not path: return
+
+        self.setWindowFilePath(path)
+
+        json_data = self.canvas.to_json()
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(json_data, ensure_ascii=False, indent=2))
+
     def save_canvas_dialog(self):
         if not self.canvas:
             return
         # プレビュー付きダイアログ
-        dlg = SaveCanvasDialog(self, create_preview_image=lambda antialiasing: self.canvas.to_qimage(antialiasing))
+        dlg = ExportCanvasDialog(self, create_preview_image=lambda antialiasing, progress_callback: self.canvas.to_qimage(antialiasing, progress_callback))
         if not dlg.exec():
             return
         path = dlg.get_params()
         if not path:
             return
-        if path.lower().endswith('.svg'):
-            self.canvas.to_svg(path)
-        else:
-            self.canvas.to_qimage(dlg.is_antialiasing_enabled()).save(path)
+        
+        dlg2 = ProgressBarDialog(self, title="エクスポート中", message="キャンバスを保存しています...")
+        worker = CanvasExportWorker(self.canvas, path, antialiasing=dlg.is_antialiasing_enabled(), progress_callback=lambda p: dlg2.update_progress(p))
+        thread = qt.QThread()
+        worker.moveToThread(thread)
+        worker.finished.connect(dlg2.accept)
+        thread.started.connect(worker.run)
+        thread.start()
+
+        dlg2.exec()
+
+        thread.quit()            
+        thread.wait()
+
+    def save_overwrite_file(self):
+        import json
+        if not self.canvas:
+            return
+        if self.windowFilePath() == "":
+            self.save_file_dialog()
+            return
+        path = self.windowFilePath()
+        with open(path, 'w', encoding='utf-8') as f:
+            json_data = self.canvas.to_json()
+            f.write(json.dumps(json_data, ensure_ascii=False, indent=2))
 
     def regenerate_active_layer(self):
         if self.canvas and 0 <= self.canvas.active_layer < len(self.canvas.layers):
             layer = self.canvas.layers[self.canvas.active_layer]
             w, h = self.canvas.width(), self.canvas.height()
             n = self.line_count_spin.value()
-            layer.lines = self.canvas.generate_lines(w, h, count=n)
-            layer.regions = self.canvas.create_regions(layer.lines)
+            layer.lines = generate_lines(w, h, count=n)
+            layer.regions = create_regions(w, h, layer.lines)
             layer.colored_regions = []
             self.canvas.update()
 

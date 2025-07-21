@@ -1,11 +1,11 @@
-import sys
-import random, math
 from typing import List
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtGui import QPainter, QPaintEvent, QPolygonF
 
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union, polygonize
+
+from geom import create_regions, generate_lines, regions_in
 
 class Layer:
     save_mode_enum = [
@@ -27,6 +27,56 @@ class Layer:
         self.line_rgba = (0, 0, 0, 255)  # 線の色もレイヤーごとに保持
         self.line_width = 2  # 線の太さ（デフォルト2）
 
+    @staticmethod
+    def from_json(w, h, data):
+        """
+        JSONからレイヤー情報を復元する
+        """
+        layer = Layer(data['name'], visible=data.get('visible', True))
+        layer.save_mode = data.get('save_mode', 0)
+        layer.lines = [LineString(line) for line in data.get('lines', [])]
+        layer.regions = create_regions(w, h, layer.lines)
+
+        layer.colored_regions = [
+            (Polygon(colored_region["coords"]), tuple(colored_region["rgba"])) for colored_region in data.get('colored_regions', [])
+        ] if data.get('colored_regions') else []
+        layer.line_rgba = tuple(data.get('line_rgba', (0, 0, 0, 255)))
+        layer.line_width = data.get('line_width', 2)
+
+        # 領域と色付き領域の整合性を確認
+        if not regions_in(layer.regions, [r for r, _ in layer.colored_regions]):
+            raise ValueError("色付き領域がレイヤーの領域と一致しません。")
+
+        return layer
+        
+    def to_json(self):
+        """
+        レイヤー情報をJSONシリアライズ可能なdictで返す
+        """
+        def lines_to_list(lines):
+            if lines is None:
+                return []
+            return [list(line.coords) for line in lines if hasattr(line, 'coords')]
+
+        def colored_regions_to_list(colored_regions):
+            return [
+                {
+                    'coords': list(region.exterior.coords),
+                    'rgba': rgba
+                }
+                for region, rgba in colored_regions if hasattr(region, 'exterior')
+            ]
+
+        return {
+            'name': self.name,
+            'visible': self.visible,
+            'save_mode': self.save_mode,
+            'lines': lines_to_list(self.lines),
+            'colored_regions': colored_regions_to_list(self.colored_regions),
+            'line_rgba': self.line_rgba,
+            'line_width': self.line_width
+        }
+
 class Canvas(QWidget):
     def __init__(self, width=800, height=600, parent=None):
         super().__init__(parent)
@@ -34,9 +84,9 @@ class Canvas(QWidget):
         self.setStyleSheet("background-color: white;")
         self.layers = [Layer("Layer 1")]
         self.active_layer = 0
-        initial_lines = self.generate_lines(width, height, count=20)
+        initial_lines = generate_lines(width, height, count=20)
         self.layers[0].lines = initial_lines
-        self.layers[0].regions = self.create_regions(initial_lines)
+        self.layers[0].regions = create_regions(width, height, initial_lines)
         self.selected_region = None
         self.colored_regions = []    # 塗りつぶした領域のリスト
         # 親(MainWindow)からRGBA値を参照
@@ -107,41 +157,6 @@ class Canvas(QWidget):
                 self.selected_region = None
                 self.update()
 
-    def generate_lines(self, width, height, count=20) -> List[LineString]:
-        lines = []
-        diag = math.hypot(width, height)
-        for _ in range(count):
-            angle = random.uniform(0, 2 * math.pi)
-            cx = random.uniform(0, width)
-            cy = random.uniform(0, height)
-            length = diag + random.uniform(20, 100)
-            dx = math.cos(angle) * length
-            dy = math.sin(angle) * length
-            x1 = cx - dx
-            y1 = cy - dy
-            x2 = cx + dx
-            y2 = cy + dy
-            lines.append(LineString([(x1, y1), (x2, y2)]))
-
-        return lines
-
-    def create_regions(self, lines):
-        # キャンバスの四辺を追加
-        w, h = self.width(), self.height()
-        all_lines = lines + [
-            LineString([(0, 0), (w, 0)]),
-            LineString([(w, 0), (w, h)]),
-            LineString([(w, h), (0, h)]),
-            LineString([(0, h), (0, 0)])
-        ]
-        merged_lines = unary_union(all_lines)
-        polygons = polygonize(merged_lines)
-        regions = []
-        for poly in polygons:
-            if isinstance(poly, Polygon):
-                regions.append(poly)
-        return regions
-
     def paintEvent(self, event: QPaintEvent):
         from PyQt6 import QtCore
         from PyQt6.QtCore import Qt
@@ -184,24 +199,23 @@ class Canvas(QWidget):
                 painter.drawLine(int(line.coords[0][0]), int(line.coords[0][1]), 
                                  int(line.coords[1][0]), int(line.coords[1][1]))
 
-    def get_shared_edges(self, target_polygons: List[Polygon], layer_idx: int) -> List[LineString]:
-        shared_edges = []
+    def get_region_boundary_edges(self, target_polygons: List[Polygon]) -> List[LineString]:
+        """
+        領域に接する線のみを取得。なお、領域は線の共有エッジしか持たず、重なることはない前提。
+        そのため、各領域の辺を取得するだけで良い。重複は除外される。
+        """
+        from shapely.geometry import LineString
+        edges: List[LineString] = []
+        for region in target_polygons:
+            coords = list(region.exterior.coords)
+            for i in range(len(coords) - 1):
+                if any(map(lambda e: self._coords_equal(e.coords[0], coords[i]) and self._coords_equal(e.coords[1], coords[i + 1]), edges)):
+                    continue
+                edge = LineString([coords[i], coords[i + 1]])
+                edges.append(edge)
 
-        for target in target_polygons:
-            for other in self.layers[layer_idx].regions:
-                if target.equals(other):
-                    continue  # 同じポリゴンはスキップ
-
-                # 共通部分を取得
-                inter = target.boundary.intersection(other.boundary)
-
-                # 共通部分が線分なら追加
-                if isinstance(inter, LineString):
-                    if not inter.is_empty:
-                        shared_edges.append(inter)
-
-        return shared_edges
-
+        return edges
+        
     def _coords_equal(self, c1, c2, tol=1e-6):
         import math
         return math.isclose(c1[0], c2[0], abs_tol=tol) and math.isclose(c1[1], c2[1], abs_tol=tol)
@@ -318,7 +332,7 @@ class Canvas(QWidget):
                         svg.append(f'<polyline points="{" ".join(f"{int(x)},{int(y)}" for x, y in coords)}" style="stroke:{stroke};stroke-width:{sw};fill:none" />')
             elif mode in (1, 2):
                 colored_polys = [region for region, _ in layer.colored_regions]
-                shared_edges = self.get_shared_edges(colored_polys, idx)
+                shared_edges = self.get_region_boundary_edges(colored_polys)
                 merged_lines = unary_union(shared_edges)
                 if hasattr(merged_lines, 'geoms'):
                     polylines = self._merge_connected_lines(merged_lines.geoms)
@@ -349,7 +363,7 @@ class Canvas(QWidget):
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(svg))
 
-    def to_qimage(self, antialiasing=False):
+    def to_qimage(self, antialiasing=False, progress_callback=None):
         from PyQt6.QtGui import QImage, QPainter, QColor, QPen, QPolygonF
         from PyQt6.QtCore import QPointF
         w, h = self.width(), self.height()
@@ -358,6 +372,8 @@ class Canvas(QWidget):
         if antialiasing:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         for idx, layer in enumerate(self.layers):
+            if progress_callback:
+                progress_callback(idx / len(self.layers))
             if not layer.visible:
                 continue
             mode = getattr(layer, 'save_mode', 0)
@@ -387,7 +403,7 @@ class Canvas(QWidget):
                         painter.drawLine(int(x1), int(y1), int(x2), int(y2))
             elif mode in (1, 2):
                 colored_polys = [region for region, _ in layer.colored_regions]
-                shared_edges = self.get_shared_edges(colored_polys, idx)
+                shared_edges = self.get_region_boundary_edges(colored_polys)
                 from shapely.geometry import LineString
                 for edge in shared_edges:
                     if isinstance(edge, LineString):
@@ -425,5 +441,31 @@ class Canvas(QWidget):
                                 x2, y2 = coords[1]
                                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
         painter.end()
+        if progress_callback: progress_callback(1.0)
         return image
 
+    def to_json(self):
+        """
+        レイヤー情報をJSONシリアライズ可能なdictで返す
+        """
+        return {
+            'width': self.width(),
+            'height': self.height(),
+            'layers': [layer.to_json() for layer in self.layers]
+        }
+
+    def reset_from_json(self, data):
+        """
+        JSONからキャンバス情報を復元する
+        """
+        self.layers = []
+        for layer_data in data.get('layers', []):
+            layer = Layer.from_json(data['width'], data['height'], layer_data)
+            self.layers.append(layer)
+        
+        # アクティブレイヤーのインデックスを設定（最初のレイヤーをアクティブにする）
+        self.active_layer = 0 if self.layers else -1
+
+        # レイヤーが空でないことを確認
+        if not self.layers:
+            raise ValueError("レイヤーが存在しません。")
